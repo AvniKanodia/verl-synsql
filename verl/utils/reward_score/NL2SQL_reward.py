@@ -8,8 +8,9 @@ Implements all four reward components from the paper while accounting for:
 
 import re
 import json
+from venv import logger
 import sqlparse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 def compute_score(data_source: str, solution_str: str, 
                  ground_truth: Dict[str, Any], extra_info: Optional[Dict] = None) -> float:
@@ -82,7 +83,8 @@ def compute_score(data_source: str, solution_str: str,
         sql_query, 
         ground_truth['expected_sql'],
         ground_truth['sql_complexity'],
-        ground_truth['question_style']
+        ground_truth['question_style'],
+        extra_info
     )
     
     if not is_correct:
@@ -143,10 +145,74 @@ def _validate_sql_execution(sql: str, schema: Optional[Dict], db_id: str, comple
         return False, str(e)
 
 def _validate_sql_result(generated_sql: str, expected_sql: str, 
-                        complexity: str, question_style: str) -> bool:
+                        complexity: str, question_style: str,
+                        extra_info: Optional[Dict] = None) -> bool:
     """
     Compare if generated SQL is semantically equivalent to expected SQL,
-    with adjustments for question style and complexity.
+    using execution-based comparison when possible.
+    """
+    # Get database connection if available
+    db_conn = extra_info.get('db_connection') if extra_info else None
+    
+    if db_conn:
+        # Use execution-based comparison when DB connection is available
+        return _compare_execution_results(
+            generated_sql,
+            expected_sql,
+            db_conn,
+            question_style
+        )
+    else:
+        # Fall back to structural comparison
+        return _structural_sql_match(
+            generated_sql,
+            expected_sql,
+            complexity,
+            question_style
+        )
+
+def _compare_execution_results(generated_sql: str, expected_sql: str, 
+                             db_conn, question_style: str) -> bool:
+    """
+    Compare queries by executing them against the database.
+    Returns True if results are equivalent.
+    """
+    try:
+        # Determine if order matters based on question style and presence of ORDER BY
+        order_matters = ('order by' in expected_sql.lower()) or (question_style != "Vague")
+        
+        # Execute generated query
+        gen_cursor = db_conn.cursor()
+        gen_cursor.execute(generated_sql)
+        gen_results = gen_cursor.fetchall()
+        
+        # Execute expected query
+        exp_cursor = db_conn.cursor()
+        exp_cursor.execute(expected_sql)
+        exp_results = exp_cursor.fetchall()
+        
+        # Compare result sets using the same logic as eval_exec_match
+        if len(gen_results) != len(exp_results):
+            return False
+            
+        if order_matters:
+            # Compare results exactly with order
+            return gen_results == exp_results
+        else:
+            # Compare results as sets (order insensitive)
+            gen_set = set(tuple(row) for row in gen_results)
+            exp_set = set(tuple(row) for row in exp_results)
+            return gen_set == exp_set
+            
+    except Exception as e:
+        logger.error(f"Execution comparison failed: {str(e)}")
+        return False
+
+def _structural_sql_match(generated_sql: str, expected_sql: str,
+                         complexity: str, question_style: str) -> bool:
+    """
+    Fallback structural comparison when DB connection is not available.
+    Uses the same normalization approach as before but with some improvements.
     """
     def normalize_sql(sql: str) -> str:
         """Normalize SQL for comparison."""
@@ -159,7 +225,7 @@ def _validate_sql_result(generated_sql: str, expected_sql: str,
             strip_comments=True
         )
     
-    # For vague questions, be more lenient with exact matches
+    # For vague questions, be more lenient with matches
     if question_style == "Vague":
         return _fuzzy_sql_match(
             normalize_sql(generated_sql),
@@ -171,7 +237,8 @@ def _validate_sql_result(generated_sql: str, expected_sql: str,
 
 def _fuzzy_sql_match(generated: str, expected: str, complexity: str) -> bool:
     """
-    Fuzzy matching for SQL queries with complexity awareness.
+    Enhanced fuzzy matching for SQL queries with complexity awareness.
+    Now includes additional checks inspired by the execution-based approach.
     """
     # Basic normalization
     gen_clean = ' '.join(generated.split())
@@ -181,13 +248,15 @@ def _fuzzy_sql_match(generated: str, expected: str, complexity: str) -> bool:
     if complexity == "Simple":
         return gen_clean == exp_clean
     
-    # For moderate/complex, check key components
+    # For moderate/complex, check key components with improved extraction
     key_components = [
         ('SELECT', _extract_select_columns),
-        ('FROM', _extract_tables),
+        ('FROM', _extract_tables_with_aliases),
         ('WHERE', _extract_conditions),
         ('GROUP BY', _extract_group_by),
-        ('ORDER BY', _extract_order_by)
+        ('ORDER BY', _extract_order_by),
+        ('HAVING', _extract_having),
+        ('LIMIT', _extract_limit)
     ]
     
     for clause, extractor in key_components:
@@ -197,6 +266,33 @@ def _fuzzy_sql_match(generated: str, expected: str, complexity: str) -> bool:
             return False
     
     return True
+
+def _extract_tables_with_aliases(sql: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    Enhanced table extraction that handles aliases.
+    Returns list of (table_name, alias) tuples.
+    """
+    tables = []
+    # Match table references with optional aliases
+    pattern = r'(?:FROM|JOIN)\s+([\w]+)(?:\s+(?:AS\s+)?([\w]+))?'
+    for match in re.finditer(pattern, sql, re.IGNORECASE):
+        table = match.group(1)
+        alias = match.group(2) if match.group(2) and match.group(2) != table else None
+        tables.append((table, alias))
+    return tables
+
+def _extract_having(sql: str) -> List[str]:
+    """Extract HAVING conditions from SQL."""
+    having_match = re.search(r'HAVING\s+(.*?)(?:\s+ORDER BY|\s+LIMIT|\s*$)', 
+                           sql, re.IGNORECASE | re.DOTALL)
+    if not having_match:
+        return []
+    return [cond.strip() for cond in re.split(r'\s+AND\s+|\s+OR\s+', having_match.group(1))]
+
+def _extract_limit(sql: str) -> Optional[str]:
+    """Extract LIMIT clause from SQL."""
+    limit_match = re.search(r'LIMIT\s+(\d+)', sql, re.IGNORECASE)
+    return limit_match.group(1) if limit_match else None
 
 def _contains_complex_features(sql: str) -> bool:
     """Check for features expected in complex queries."""
