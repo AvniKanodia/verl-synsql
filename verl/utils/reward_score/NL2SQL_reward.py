@@ -1,343 +1,218 @@
-"""
-Custom NL2SQL reward function for verl with structured output support.
-Implements all four reward components from the paper while accounting for:
-- db_id, sql_complexity, question_style, and other metadata
-- Maintains progressive rewards (format, execution, result)
-- Length reward commented out but preserved
-"""
-
-import re
+import sqlglot
+from sqlglot import exp, ParseError
 import json
-from venv import logger
-import sqlparse
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Optional
 
 def compute_score(data_source: str, solution_str: str, 
                  ground_truth: Dict[str, Any], extra_info: Optional[Dict] = None) -> float:
     """
-    NL2SQL progressive reward function with structured output support.
-    
-    Args:
-        data_source: Dataset name (e.g., 'nl2sql')
-        solution_str: Generated response containing <think>, <answer>, and SQL
-        ground_truth: Must contain:
-            - 'expected_sql': Correct SQL query
-            - 'db_id': Database identifier
-            - 'sql_complexity': Complexity level (Simple/Moderate/Complex)
-            - 'question_style': Style of question (Vague/Colloquial/Imperative)
-            - 'db_schema': Dict of {table: [columns]} for validation
-            - 'max_length': Maximum allowed response length (optional)
-        extra_info: Additional context (unused)
-    
-    Returns:
-        float: Total reward score incorporating all components
+    Final optimized NL2SQL reward function with enhanced complex query handling
     """
-    
-   # Initialize all reward components
-    rewards = {
-        'format': 0,
-        'execution': 0,
-        'result': 0,
-    }
-    
     try:
-        # Parse the JSON input to get the actual response text
-        response_data = json.loads(solution_str)
-        actual_response = response_data.get('cot', '')
+        # Parse response and extract SQL
+        response = json.loads(solution_str)
+        cot = response.get('cot', '')
+        sql = _extract_sql(cot)
+        
+        # Format validation (1 point)
+        if not sql or not _validate_format(cot):
+            return 0.0
+        score = 1.0
+        
+        # SQL Validation (2 points)
+        try:
+            parsed = sqlglot.parse(sql, read="sqlite")[0]
+            
+            # Basic SELECT validation - allow complex queries through
+            if not isinstance(parsed, exp.Select):
+                return score
+                
+            # Schema validation - more permissive for complex queries
+            if ground_truth.get('db_schema'):
+                schema_valid = _validate_schema(parsed, ground_truth['db_schema'])
+                if not schema_valid:
+                    if ground_truth['sql_complexity'] != "Complex":
+                        return score
+                    # For complex queries, try fuzzy schema matching
+                    if not _fuzzy_validate_schema(parsed, ground_truth['db_schema']):
+                        return score
+                        
+            score += 2.0  # Always award execution points if we got this far
+            
+            # Special handling for complex query comparison
+            expected_parsed = sqlglot.parse(ground_truth['expected_sql'], read="sqlite")[0]
+            if ground_truth['sql_complexity'] == "Complex":
+                if _compare_complex_queries(parsed, expected_parsed):
+                    score += 3.0
+            else:
+                if parsed.sql(normalize=True) == expected_parsed.sql(normalize=True):
+                    score += 3.0
+                    
+        except ParseError:
+            return score
+            
+        return score
+        
     except json.JSONDecodeError:
-        actual_response = solution_str  # Fallback if not JSON
+        return 0.0
 
-    # --------------------------
-    # 1. Format Reward (Sf)
-    # --------------------------
-    if not _validate_format(actual_response):
-        rewards['format'] = -1
-        return sum(rewards.values())
-    rewards['format'] = 1
+def _validate_schema(parsed: exp.Expression, schema: Dict[str, list]) -> bool:
+    """Enhanced schema validation with proper table/column checking"""
+    # Get all referenced tables with aliases
+    table_refs = {}
+    for table in parsed.find_all(exp.Table):
+        table_refs[table.alias_or_name.lower()] = table.name.lower()
     
-    # Extract SQL query
-    sql_query = _extract_sql(actual_response)
-    if not sql_query:
-        rewards['format'] = -1
-        return sum(rewards.values())
-    
-    # --------------------------
-    # 2. Execution Reward (Se)
-    # --------------------------
-    is_valid, _ = _validate_sql_execution(
-        sql_query, 
-        ground_truth.get('db_schema'),
-        ground_truth['db_id'],
-        ground_truth['sql_complexity']
-    )
-    
-    if not is_valid:
-        rewards['execution'] = -2
-        return sum(rewards.values())
-    rewards['execution'] = 2
-    
-    # --------------------------
-    # 3. Result Reward (Sr)
-    # --------------------------
-    is_correct = _validate_sql_result(
-        sql_query, 
-        ground_truth['expected_sql'],
-        ground_truth['sql_complexity'],
-        ground_truth['question_style'],
-        extra_info
-    )
-    
-    if not is_correct:
-        rewards['result'] = -3
-        return sum(rewards.values())
-    rewards['result'] = 3
-    
-    return sum(rewards.values())
-
-# --------------------------
-# Helper Functions (Modified for structured output)
-# --------------------------
-
-def _validate_format(response: str) -> bool:
-    """Check for required XML tags and SQL code blocks."""
-    required_tags = [
-        ('<think>', '</think>'),
-        ('<answer>', '</answer>'),
-        ('```sql', '```')
-    ]
-    return all(start in response and end in response for start, end in required_tags)
-
-def _extract_sql(response: str) -> str:
-    """Extract SQL query from between ```sql ``` markers."""
-    try:
-        sql_start = response.index('```sql') + 6
-        sql_end = response.index('```', sql_start)
-        return response[sql_start:sql_end].strip()
-    except ValueError:
-        return ""
-
-def _validate_sql_execution(sql: str, schema: Optional[Dict], db_id: str, complexity: str) -> tuple:
-    """
-    Validate SQL syntax and schema compliance with metadata awareness.
-    Returns (is_valid: bool, error: str)
-    """
-    try:
-        # 1. Basic SQL syntax validation using sqlparse
-        parsed = sqlparse.parse(sql)
-        if not parsed or not all(stmt.get_type() == 'SELECT' for stmt in parsed):
-            return False, "Only SELECT queries are supported"
-        
-        # 2. Schema validation if schema provided
-        if schema:
-            tables = _extract_tables(sql)
-            for table in tables:
-                if table not in schema:
-                    return False, f"Table '{table}' not in schema for db_id '{db_id}'"
-            
-            # Additional validation based on SQL complexity
-            if complexity == "Complex":
-                # Check for appropriate complex query features
-                if not _contains_complex_features(sql):
-                    return False, "Missing complex query features for complexity level"
-        
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-def _validate_sql_result(generated_sql: str, expected_sql: str, 
-                        complexity: str, question_style: str,
-                        extra_info: Optional[Dict] = None) -> bool:
-    """
-    Compare if generated SQL is semantically equivalent to expected SQL,
-    using execution-based comparison when possible.
-    """
-    # Get database connection if available
-    db_conn = extra_info.get('db_connection') if extra_info else None
-    
-    if db_conn:
-        # Use execution-based comparison when DB connection is available
-        return _compare_execution_results(
-            generated_sql,
-            expected_sql,
-            db_conn,
-            question_style
-        )
-    else:
-        # Fall back to structural comparison
-        return _structural_sql_match(
-            generated_sql,
-            expected_sql,
-            complexity,
-            question_style
-        )
-
-def _compare_execution_results(generated_sql: str, expected_sql: str, 
-                             db_conn, question_style: str) -> bool:
-    """
-    Compare queries by executing them against the database.
-    Returns True if results are equivalent.
-    """
-    try:
-        # Determine if order matters based on question style and presence of ORDER BY
-        order_matters = ('order by' in expected_sql.lower()) or (question_style != "Vague")
-        
-        # Execute generated query
-        gen_cursor = db_conn.cursor()
-        gen_cursor.execute(generated_sql)
-        gen_results = gen_cursor.fetchall()
-        
-        # Execute expected query
-        exp_cursor = db_conn.cursor()
-        exp_cursor.execute(expected_sql)
-        exp_results = exp_cursor.fetchall()
-        
-        # Compare result sets using the same logic as eval_exec_match
-        if len(gen_results) != len(exp_results):
-            return False
-            
-        if order_matters:
-            # Compare results exactly with order
-            return gen_results == exp_results
-        else:
-            # Compare results as sets (order insensitive)
-            gen_set = set(tuple(row) for row in gen_results)
-            exp_set = set(tuple(row) for row in exp_results)
-            return gen_set == exp_set
-            
-    except Exception as e:
-        logger.error(f"Execution comparison failed: {str(e)}")
+    # Check all base tables exist
+    schema_tables = {t.lower() for t in schema.keys()}
+    if not {t.lower() for t in table_refs.values()}.issubset(schema_tables):
         return False
+        
+    # Check columns
+    for column in parsed.find_all(exp.Column):
+        table_name = None
+        
+        # Resolve table reference through aliases
+        if column.table:
+            table_name = table_refs.get(column.table.lower(), column.table.lower())
+        
+        # Validate column exists in its table
+        if table_name in schema:
+            valid_columns = {c.lower() for c in schema[table_name]}
+            if column.name.lower() not in valid_columns:
+                return False
+                
+    return True
 
-def _structural_sql_match(generated_sql: str, expected_sql: str,
-                         complexity: str, question_style: str) -> bool:
-    """
-    Fallback structural comparison when DB connection is not available.
-    Uses the same normalization approach as before but with some improvements.
-    """
-    def normalize_sql(sql: str) -> str:
-        """Normalize SQL for comparison."""
-        parsed = sqlparse.parse(sql)[0]
-        return sqlparse.format(
-            str(parsed),
-            reindent=True,
-            keyword_case='upper',
-            identifier_case='lower',
-            strip_comments=True
-        )
+def _fuzzy_validate_schema(parsed: exp.Expression, schema: Dict[str, list]) -> bool:
+    """More permissive schema validation for complex queries"""
+    # Get all referenced tables
+    tables = {t.name.lower() for t in parsed.find_all(exp.Table)}
+    schema_tables = {t.lower() for t in schema.keys()}
     
-    # For vague questions, be more lenient with matches
-    if question_style == "Vague":
-        return _fuzzy_sql_match(
-            normalize_sql(generated_sql),
-            normalize_sql(expected_sql),
-            complexity
-        )
+    # Allow partial matches for complex queries
+    if not tables.issubset(schema_tables):
+        # Check if at least one table matches
+        return len(tables & schema_tables) > 0
+        
+    return True
+
+def _sql_equivalence(actual: exp.Expression, expected: exp.Expression,
+                    question_style: str, complexity: str) -> bool:
+    """
+    Enhanced SQL comparison with special handling for complex JOIN queries
+    """
+    # For complex queries, use specialized JOIN-aware comparison
+    if complexity == "Complex":
+        return _compare_complex_queries(actual, expected)
+    elif question_style == "Vague":
+        return _compare_ast_component(actual, expected, 'where')
     else:
-        return normalize_sql(generated_sql) == normalize_sql(expected_sql)
+        return actual.sql(normalize=True) == expected.sql(normalize=True)
 
-def _fuzzy_sql_match(generated: str, expected: str, complexity: str) -> bool:
-    """
-    Enhanced fuzzy matching for SQL queries with complexity awareness.
-    Now includes additional checks inspired by the execution-based approach.
-    """
-    # Basic normalization
-    gen_clean = ' '.join(generated.split())
-    exp_clean = ' '.join(expected.split())
+def _compare_complex_queries(actual: exp.Expression, expected: exp.Expression) -> bool:
+    """Specialized comparison for complex queries with JOINs"""
+    # Compare SELECT clauses
+    if not _compare_selects(actual, expected):
+        return False
+        
+    # Compare JOIN structures
+    if not _compare_join_structures(actual, expected):
+        return False
+        
+    # Compare WHERE clauses if present
+    if not _compare_where_clauses(actual, expected):
+        return False
+        
+    return True
+
+def _compare_selects(a: exp.Expression, b: exp.Expression) -> bool:
+    """Compare SELECT clauses with column order insensitivity"""
+    a_selects = {col.sql(normalize=True) for col in a.find_all(exp.Column)}
+    b_selects = {col.sql(normalize=True) for col in b.find_all(exp.Column)}
+    return a_selects == b_selects
+
+def _compare_join_structures(a: exp.Expression, b: exp.Expression) -> bool:
+    """Compare JOIN structures with order insensitivity"""
+    a_joins = {}
+    for join in a.find_all(exp.Join):
+        key = join.this.sql(normalize=True)
+        a_joins[key] = join.args.get("on", "").sql(normalize=True) if join.args.get("on") else ""
     
-    # For simple queries, exact match is required
-    if complexity == "Simple":
-        return gen_clean == exp_clean
+    b_joins = {}
+    for join in b.find_all(exp.Join):
+        key = join.this.sql(normalize=True)
+        b_joins[key] = join.args.get("on", "").sql(normalize=True) if join.args.get("on") else ""
     
-    # For moderate/complex, check key components with improved extraction
-    key_components = [
-        ('SELECT', _extract_select_columns),
-        ('FROM', _extract_tables_with_aliases),
-        ('WHERE', _extract_conditions),
-        ('GROUP BY', _extract_group_by),
-        ('ORDER BY', _extract_order_by),
-        ('HAVING', _extract_having),
-        ('LIMIT', _extract_limit)
-    ]
+    return a_joins == b_joins
+
+def _compare_where_clauses(a: exp.Expression, b: exp.Expression) -> bool:
+    """Compare WHERE clauses with condition order insensitivity"""
+    a_where = a.find(exp.Where)
+    b_where = b.find(exp.Where)
     
-    for clause, extractor in key_components:
-        gen_part = extractor(gen_clean)
-        exp_part = extractor(exp_clean)
-        if gen_part != exp_part:
+    if not a_where and not b_where:
+        return True
+    if bool(a_where) != bool(b_where):
+        return False
+        
+    # Split conditions and compare sets
+    a_conditions = {cond.sql(normalize=True) for cond in a_where.find_all(exp.Condition)}
+    b_conditions = {cond.sql(normalize=True) for cond in b_where.find_all(exp.Condition)}
+    
+    return a_conditions == b_conditions
+
+def _compare_joins(a: exp.Expression, b: exp.Expression) -> bool:
+    """Robust JOIN comparison that handles different JOIN orders"""
+    a_tables = {}
+    b_tables = {}
+    
+    # Extract all table references with their join conditions
+    for join in a.find_all(exp.Join):
+        a_tables[join.this.sql()] = join.args.get("on")
+    for join in b.find_all(exp.Join):
+        b_tables[join.this.sql()] = join.args.get("on")
+    
+    # Compare table sets and join conditions
+    if set(a_tables.keys()) != set(b_tables.keys()):
+        return False
+    
+    # Compare join conditions (normalized)
+    for table, a_cond in a_tables.items():
+        b_cond = b_tables[table]
+        if a_cond and b_cond:
+            if a_cond.sql(normalize=True) != b_cond.sql(normalize=True):
+                return False
+        elif a_cond or b_cond:
             return False
     
     return True
 
-def _extract_tables_with_aliases(sql: str) -> List[Tuple[str, Optional[str]]]:
-    """
-    Enhanced table extraction that handles aliases.
-    Returns list of (table_name, alias) tuples.
-    """
-    tables = []
-    # Match table references with optional aliases
-    pattern = r'(?:FROM|JOIN)\s+([\w]+)(?:\s+(?:AS\s+)?([\w]+))?'
-    for match in re.finditer(pattern, sql, re.IGNORECASE):
-        table = match.group(1)
-        alias = match.group(2) if match.group(2) and match.group(2) != table else None
-        tables.append((table, alias))
-    return tables
+def _compare_ast_component(a: exp.Expression, b: exp.Expression, 
+                          component: str) -> bool:
+    """Robust component comparison with JOIN handling"""
+    a_comp = a.find(getattr(exp, component.capitalize()))
+    b_comp = b.find(getattr(exp, component.capitalize()))
+    
+    if not a_comp and not b_comp:
+        return True
+    if bool(a_comp) != bool(b_comp):
+        return False
+        
+    return a_comp.sql(normalize=True) == b_comp.sql(normalize=True)
 
-def _extract_having(sql: str) -> List[str]:
-    """Extract HAVING conditions from SQL."""
-    having_match = re.search(r'HAVING\s+(.*?)(?:\s+ORDER BY|\s+LIMIT|\s*$)', 
-                           sql, re.IGNORECASE | re.DOTALL)
-    if not having_match:
-        return []
-    return [cond.strip() for cond in re.split(r'\s+AND\s+|\s+OR\s+', having_match.group(1))]
+def _extract_sql(response: str) -> str:
+    """Extract SQL from markdown code block"""
+    try:
+        start = response.index('```sql') + 6
+        end = response.index('```', start)
+        return response[start:end].strip()
+    except ValueError:
+        return ""
 
-def _extract_limit(sql: str) -> Optional[str]:
-    """Extract LIMIT clause from SQL."""
-    limit_match = re.search(r'LIMIT\s+(\d+)', sql, re.IGNORECASE)
-    return limit_match.group(1) if limit_match else None
-
-def _contains_complex_features(sql: str) -> bool:
-    """Check for features expected in complex queries."""
-    complex_patterns = [
-        r'JOIN\s+\w+\s+ON',       # Joins
-        r'GROUP BY',               # Grouping
-        r'HAVING',                 # Having clauses
-        r'UNION\s+(ALL\s+)?SELECT', # Unions
-        r'WITH\s+\w+\s+AS\s*\(',   # CTEs
-        r'CASE WHEN.*?END'         # Case statements
-    ]
-    return any(re.search(pattern, sql, re.IGNORECASE) for pattern in complex_patterns)
-
-def _extract_tables(sql: str) -> list:
-    """Extract table names from SQL."""
-    tables = set()
-    # Simple regex - would need to enhance for complex queries
-    for match in re.finditer(r'(?:FROM|JOIN)\s+([\w]+)', sql, re.IGNORECASE):
-        tables.add(match.group(1))
-    return list(tables)
-
-def _extract_select_columns(sql: str) -> list:
-    """Extract selected columns from SQL."""
-    select_match = re.search(r'SELECT\s+(.*?)\s+FROM', sql, re.IGNORECASE | re.DOTALL)
-    if not select_match:
-        return []
-    return [col.strip() for col in select_match.group(1).split(',')]
-
-def _extract_conditions(sql: str) -> list:
-    """Extract WHERE conditions from SQL."""
-    where_match = re.search(r'WHERE\s+(.*?)(?:\s+GROUP BY|\s+ORDER BY|\s*$)', sql, re.IGNORECASE | re.DOTALL)
-    if not where_match:
-        return []
-    return [cond.strip() for cond in re.split(r'\s+AND\s+|\s+OR\s+', where_match.group(1))]
-
-def _extract_group_by(sql: str) -> list:
-    """Extract GROUP BY columns from SQL."""
-    group_match = re.search(r'GROUP BY\s+(.*?)(?:\s+HAVING|\s+ORDER BY|\s*$)', sql, re.IGNORECASE | re.DOTALL)
-    if not group_match:
-        return []
-    return [col.strip() for col in group_match.group(1).split(',')]
-
-def _extract_order_by(sql: str) -> list:
-    """Extract ORDER BY columns from SQL."""
-    order_match = re.search(r'ORDER BY\s+(.*?)\s*$', sql, re.IGNORECASE | re.DOTALL)
-    if not order_match:
-        return []
-    return [col.strip() for col in order_match.group(1).split(',')]
+def _validate_format(response: str) -> bool:
+    """Validate required XML tags exist"""
+    return ('<think>' in response and 
+            '</think>' in response and
+            '<answer>' in response and
+            '</answer>' in response)
